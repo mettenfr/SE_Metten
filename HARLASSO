@@ -1,0 +1,260 @@
+# Script to conduct an out-of-sample forecast analysis with the HAR(3)-RV model,
+# the lasso, the adaptive lasso and the elastic net method.
+#
+# Please choose the start and end date of your data.
+# Also you have to choose the window size for forecasting.
+
+# Load the required packages
+library(reshape2)
+library(data.table)
+library(ggplot2)
+library(scales)
+library(readxl)
+library(zoo)
+library(grid)
+library(gridExtra)
+library(tseries)
+library(glmnet)
+
+
+# Give start and end date for the time interval to analyse
+start <- as.POSIXct('2017-07-04')
+end <- as.POSIXct('2018-07-02')
+
+# Give the window size of the estimation period for the rolling window forecast
+window <- 211
+
+# Read the data - an excel sheet with two columns (date and prices) are expected
+#price <- as.data.table(read_excel("XXX.xlsx", sheet = 1))
+
+# Compute log returns (without overnight returns)
+logprice <- price[Date >= start & Date <= end, .(Date, LogPrice = log(Close))]
+return <- logprice[,.(Date, LogPrice, Return = rollapply(LogPrice, 2, diff, fill = NA, align  = c('right'))), by = as.Date(Date)]
+return <- na.omit(return)
+
+# Compute daily RV 
+returnsq <- return[, .(as.Date, ReturnSq = Return^2)]
+rvdaily <- returnsq[, .(RvDaily = sqrt(sum(ReturnSq))), by = as.Date]
+setnames(rvdaily, old = 'as.Date', new = 'Date')
+
+# Compute weekly RV and monthly RV
+rv <- rvdaily[, .(Date, RvDaily, RvWeekly = rollmean(RvDaily, 5, fill = NA, align = c("right")), RvMonthly = rollmean(RvDaily, 22, fill = NA, align = c("right")))]
+rv <- na.omit(rv)
+
+# Fit HAR(3) model
+olshardata <- rv[, .(Date = shift(Date, 1, type = 'lead'), RvDailyY = shift(RvDaily, 1, type = 'lead'), RvDaily, RvWeekly, RvMonthly)]
+olshardata <- na.omit(olshardata)
+olshar <- lm(RvDailyY ~ RvDaily + RvWeekly + RvMonthly, data = olshardata)
+class(olshar)
+summary(olshar)
+
+# Compute RV for the days 2-22
+rvallcolname <- c(paste0('RV_',2:22, sep = '')) # vector for column name in rvall
+rvall <- rvdaily # starting datatable
+for (j in 2 : 22) {
+  rvall <- rvall[, c(rvallcolname[j-1]) := rollmean(RvDaily, j, fill = NA, align = c("right"))]
+}
+rvall <- na.omit(rvall)
+
+# Fit AR(22)
+ar22 <- arma(rvdaily[,2], order = c(22,0))
+summary(ar22)
+
+# glmnet package needs matrix object
+fcdatax <- as.matrix(rvall[-nrow(rvall), -'Date']) # Remove last row that dim x = dim y
+fcdatay <- as.matrix(na.omit(rv[, .(RvDailyvY = shift(RvDaily, 1, type = 'lead'))]))
+
+# Fit LASSO HAR
+fitlasso <- cv.glmnet(fcdatax, fcdatay, alpha = 1) # LASSO with cross-validation to find lambda
+coeflasso <- predict(fitlasso, s = 'lambda.min', type = 'coefficients')
+coeflasso
+
+# Fit adaptive LASSO HAR
+# Compute ridge coefficients to get the weights
+fitridge <- cv.glmnet(fcdatax, fcdatay)
+wghts <- 1/abs(matrix(predict(fitridge, s = 'lambda.min', type = 'coefficients')[-1,]))
+wghts[wghts[,1] == Inf] <- 1e+10 # make infinite values as big as possible
+
+# Compute adaptive LASSO
+fitallaso <- cv.glmnet(fcdatax, fcdatay, alpha = 1, penalty.factor = wghts)
+coefalaaso <- predict(fitallaso, s = 'lambda.min', type = 'coefficients')
+coefalaaso
+
+# Fit Elastic Net
+fitenet <- cv.glmnet(fcdatax, fcdatay, alpha = 0.5) # LASSO with cross-validation to find lambda
+coefenet <- predict(fitenet, s = 'lambda.min', type = 'coefficients')
+coefenet
+
+
+#---------------------------------
+# Forecasting
+
+# Forecast HAR(3) model
+fchardata <- rv[, .(Date = shift(Date, 1, type = 'lead'), RvDailyY = shift(RvDaily, 1, type = 'lead'), RvDaily, RvWeekly, RvMonthly)]
+fchardata <- na.omit(olshardata)
+
+fcy <- fchardata[-(1:window), .(Date, RvDailyY)] # period to be forecasted
+
+fchar <- fchardata[-(1:window), .(Date, FcHar = 1e+10)] # store for forecast values 
+for (j in 1 : (nrow(fchardata) - window)) {
+  train <- fchardata[j : (j + window - 1),]
+  test <- fchardata[j + window,]
+  
+  ols <- lm(RvDailyY ~ RvDaily + RvWeekly + RvMonthly, data = train)
+  fc <- predict(ols, test)
+  fchar[j,2] <- fc
+}
+
+# Forecast LASSO
+
+# glmnet needs a matrix object
+fcdatax <- as.matrix(rvall[-nrow(rvall), -'Date']) # Remove last row that dim x = dim y
+fcdatay <- as.matrix(na.omit(rv[, .(RvDailyvY = shift(RvDaily, 1, type = 'lead'))]))
+
+fclasso <- fchardata[-(1:window), .(Date, FcLasso = 1e+10)] # store for forecast values
+
+for (j in 1 : (nrow(fcdatax) - window)) {
+  trainx <- fcdatax[j : (j + window - 1),]
+  trainy <- fcdatay[j : (j + window - 1)]
+  testx <- t(fcdatax[(j + window) : (j + window),])
+
+  cv <- cv.glmnet(trainx, trainy, alpha = 1) # cross-validation to find lambda
+  fc <- predict(cv, s = 'lambda.min', newx = testx)
+  fclasso[j,2] <- fc[1]
+}
+
+# Adaptive LASSO model
+fcalasso <- fchardata[-(1:window), .(Date, FcaLasso = 1e+10)] # store for forecast values
+
+for (j in 1 : (nrow(fcdatax) - window)) {
+  trainx <- fcdatax[j : (j + window - 1),]
+  trainy <- fcdatay[j : (j + window - 1)]
+  testx <- t(fcdatax[(j + window) : (j + window),])
+  
+  # Compute ridge coefficients to get the weights
+  coefridge <- cv.glmnet(trainx, trainy)
+  wghts <- 1/abs(matrix(predict(coefridge, s = 'lambda.min', type = 'coefficients')[-1,]))
+  wghts[wghts[,1] == Inf] <- 1e+10 # make infinite values really big
+  
+  # Compute adaptive LASSO
+  cv <- cv.glmnet(trainx, trainy, alpha = 1, penalty.factor = wghts)
+  fc <- predict(cv, s = 'lambda.min', newx = testx)
+  fcalasso[j,2] <- fc[1]
+}
+
+# Elastic Net model
+fcenet <- fchardata[-(1:window), .(Date, FcEnet = 1e+10)] # store for forecast values
+
+for (j in 1 : (nrow(fcdatax) - window)) {
+  trainx <- fcdatax[j : (j + window - 1),]
+  trainy <- fcdatay[j : (j + window - 1)]
+  testx <- t(fcdatax[(j + window) : (j + window),])
+  
+  cv <- cv.glmnet(trainx, trainy, alpha = 0.5) # cross-validation to find lambda
+  fc <- predict(cv, s = 'lambda.min', newx = testx)
+  fcenet[j,2] <- fc[1]
+}
+
+# MSE
+msefchar <- mean((fcy$RvDailyY - fchar$FcHar)^2)
+msefclasso <- mean((fcy$RvDailyY - fclasso$FcLasso)^2)
+msefcalasso <- mean((fcy$RvDailyY - fcalasso$FcaLasso)^2)
+msefcenet <- mean((fcy$RvDailyY - fcenet$FcEnet)^2)
+
+# MAE
+msafchar <- mean(abs(fcy$RvDailyY - fchar$FcHar))
+msafclasso <- mean(abs(fcy$RvDailyY - fclasso$FcLasso))
+msafcalasso <- mean(abs(fcy$RvDailyY - fcalasso$FcaLasso))
+msafcenet <- mean(abs(fcy$RvDailyY - fcenet$FcEnet))
+
+# Mincer-Zarnowitz R2
+r2har <- lm(fcy$RvDailyY ~ fchar$FcHar)
+summary(r2har)
+r2lasso <- lm(fcy$RvDailyY ~ fclasso$FcLasso)
+summary(r2lasso)
+r2alasso <- lm(fcy$RvDailyY ~ fcalasso$FcaLasso)
+summary(r2alasso)
+r2enet <- lm(fcy$RvDailyY ~ fcenet$FcEnet)
+summary(r2enet)
+
+# Plot the forecasted HAR against the realized volatility
+c <- merge(fcy, fchar, 'Date')
+datafchar <- melt(c, id.vars = 'Date', value.name = 'value')
+png(filename = 'PlotFcHar.png', width = 600, height = 400, type = 'cairo')
+plotfchar <- ggplot(datafchar, aes(x = Date, y = value, colour = variable, group = variable)) +
+  geom_line() +
+  labs(x = "Date", y = "RV", title = "HAR(3)-RV") +
+  guides(fill = T) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 15),
+        panel.grid.major.y = element_line(colour = "darkgrey", size = 0.1),
+        panel.grid.major.x = element_line(colour = "darkgrey", size = 0.1),
+        panel.grid.minor.x = element_line(colour = NA),
+        axis.title.y = element_text(margin = margin(0,20,0,0)),
+        axis.title.x = element_text(margin = margin(20,0,0,0)),
+        legend.position = "top", legend.title = element_blank())
+
+
+# Plot the forecasted LASSO against the realized volatility
+cc <- merge(fcy, fclasso, 'Date')
+datafclasso <- melt(cc, id.vars = 'Date', value.name = 'value')
+png(filename = 'PlotFcLasso.png', width = 600, height = 400, type = 'cairo')
+plotfclasso <- ggplot(datafclasso, aes(x = Date, y = value, colour = variable, group = variable)) +
+  geom_line() +
+  labs(x = "Date", y = "RV", title = "HAR-LASSO") +
+  guides(fill = T) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 15),
+        panel.grid.major.y = element_line(colour = "darkgrey", size = 0.1),
+        panel.grid.major.x = element_line(colour = "darkgrey", size = 0.1),
+        panel.grid.minor.x = element_line(colour = NA),
+        axis.title.y = element_text(margin = margin(0,20,0,0)),
+        axis.title.x = element_text(margin = margin(20,0,0,0)),
+        legend.position = "top", legend.title = element_blank())
+
+
+# Plot the forecasted adaptive LASSO against the realized volatility
+cccc <- merge(fcy, fcalasso, 'Date')
+datafcalasso <- melt(cccc, id.vars = 'Date', value.name = 'value')
+png(filename = 'PlotFcaLasso.png', width = 600, height = 400, type = 'cairo')
+plotfcalasso <- ggplot(datafcalasso, aes(x = Date, y = value, colour = variable, group = variable)) +
+  geom_line() +
+  labs(x = "Date", y = "RV", title = "HAR-adaptive LASSO") +
+  guides(fill = T) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 15),
+        panel.grid.major.y = element_line(colour = "darkgrey", size = 0.1),
+        panel.grid.major.x = element_line(colour = "darkgrey", size = 0.1),
+        panel.grid.minor.x = element_line(colour = NA),
+        axis.title.y = element_text(margin = margin(0,20,0,0)),
+        axis.title.x = element_text(margin = margin(20,0,0,0)),
+        legend.position = "top", legend.title = element_blank())
+
+
+# Plot the forecasted Elastic Net against the realized volatility
+ccc <- merge(fcy, fcenet, 'Date')
+datafcenet <- melt(ccc, id.vars = 'Date', value.name = 'value')
+png(filename = 'PlotFcEnet.png', width = 600, height = 400, type = 'cairo')
+plotfcenet <- ggplot(datafcenet, aes(x = Date, y = value, colour = variable, group = variable)) +
+  geom_line() +
+  labs(x = "Date", y = "RV", title = "HAR-Elastic Net") +
+  guides(fill = T) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 15),
+        panel.grid.major.y = element_line(colour = "darkgrey", size = 0.1),
+        panel.grid.major.x = element_line(colour = "darkgrey", size = 0.1),
+        panel.grid.minor.x = element_line(colour = NA),
+        axis.title.y = element_text(margin = margin(0,20,0,0)),
+        axis.title.x = element_text(margin = margin(20,0,0,0)),
+        legend.position = "top", legend.title = element_blank())
+
+
+# All four plots in a one pic
+png(filename = 'PlotFc.png', width = 600, height = 400, type = 'cairo')
+plotfc <- grid.arrange(plotfchar, plotfclasso, plotfcenet, plotfcalasso)
+print(plotfc)
+dev.off()
